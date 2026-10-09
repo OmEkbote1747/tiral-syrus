@@ -11,130 +11,13 @@ import json
 from typing import AsyncIterator, Optional
 import httpx
 import google.generativeai as genai
+from google.generativeai.types import content_types
 
 from config import settings
 
 # ---------------------------------------------------------------------------
-# Tool definitions (passed to Gemini using function calling)
+# System Prompt
 # ---------------------------------------------------------------------------
-
-TOOLS = [
-    {
-        "name": "get_quote",
-        "description": (
-            "Get the current live price quote for a stock symbol. "
-            "Use this whenever the trader asks about a stock price, bid/ask, volume, or day range. "
-            "Symbol format: RELIANCE.NS, INFY.NS, TCS.NS, NIFTY50, etc."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "symbol": {
-                    "type": "string",
-                    "description": "NSE stock symbol e.g. RELIANCE.NS, INFY.NS, NIFTY50",
-                }
-            },
-            "required": ["symbol"],
-        },
-    },
-    {
-        "name": "get_portfolio",
-        "description": (
-            "Get the trader's account summary: available funds, total portfolio value, funds used. "
-            "Use when the trader asks about account balance, funds, or overall portfolio value."
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "get_positions",
-        "description": (
-            "Get all current open positions with live P&L. "
-            "Use when the trader asks about positions, holdings, unrealized P&L, or exposure."
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "get_order_history",
-        "description": (
-            "Get recent order history. "
-            "Use when the trader asks what orders have been placed, filled, cancelled, etc."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "enum": ["ALL", "FILLED", "PARTIAL", "REJECTED", "CANCELLED"],
-                    "description": "Filter by order status. Default: ALL",
-                }
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "search_instrument",
-        "description": (
-            "Search the instrument master to find valid symbols and their details. "
-            "Use to verify a symbol before including it in an order draft."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search term e.g. 'Reliance', 'INFY', 'HDFC Bank'",
-                }
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "create_order_draft",
-        "description": (
-            "Create a draft order for the trader to review and approve. "
-            "NEVER use this without first calling get_quote to get the latest price. "
-            "This does NOT place an order — it only creates a draft that the trader must approve. "
-            "The system will validate symbol, check risk limits, and display a confirmation card."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "symbol":       {"type": "string", "description": "Valid NSE symbol"},
-                "side":         {"type": "string", "enum": ["BUY", "SELL"]},
-                "order_type":   {"type": "string", "enum": ["MARKET", "LIMIT", "SL", "SL-M"]},
-                "quantity":     {"type": "integer", "minimum": 1},
-                "price":        {"type": "number", "description": "Required for LIMIT/SL orders"},
-                "trigger_price":{"type": "number", "description": "Required for SL/SL-M orders"},
-                "rationale":    {"type": "string", "description": "Brief explanation of this order"},
-            },
-            "required": ["symbol", "side", "order_type", "quantity"],
-        },
-    },
-    {
-        "name": "create_standing_instruction",
-        "description": (
-            "Create a standing instruction (rule) that will automatically trigger an order when a condition is met. "
-            "Example: 'If INFY drops below 1750, sell 50 shares'. "
-            "The rule is stored and checked against live prices. It fires exactly once. "
-            "Always show the trader the exact condition and action before creating — they must approve it."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name":           {"type": "string", "description": "Short name for this rule"},
-                "symbol":         {"type": "string"},
-                "condition_type": {"type": "string", "enum": ["PRICE_ABOVE", "PRICE_BELOW", "PERCENT_CHANGE"]},
-                "condition_value":{"type": "number", "description": "Price level or percent threshold"},
-                "action_side":    {"type": "string", "enum": ["BUY", "SELL"]},
-                "action_quantity":{"type": "integer", "minimum": 1},
-                "action_order_type": {"type": "string", "enum": ["MARKET", "LIMIT"], "default": "MARKET"},
-                "expires_in_hours":  {"type": "number", "description": "Auto-expire after N hours"},
-            },
-            "required": ["name", "symbol", "condition_type", "condition_value", "action_side", "action_quantity"],
-        },
-    },
-]
-
 
 SYSTEM_PROMPT = """You are StockItUp, an AI trading copilot for the 021 trading platform.
 You help traders manage their portfolio and place orders by understanding plain English requests.
@@ -156,25 +39,104 @@ RESPONSE FORMAT:
 You have access to live NSE market data via yfinance. Prices are real and updated every 15 seconds."""
 
 
-def convert_tools_to_gemini_format(tools):
-    """Convert our tool definitions to Gemini's function declaration format."""
-    gemini_tools = []
-    for tool in tools:
-        gemini_tool = {
-            "name": tool["name"],
-            "description": tool["description"],
-            "parameters": tool.get("parameters", tool.get("input_schema", {}))
-        }
-        gemini_tools.append(gemini_tool)
-    return gemini_tools
-
-
 class TradingAgent:
     def __init__(self):
         genai.configure(api_key=settings.gemini_api_key)
+
+        # Define tools as Gemini function declarations
+        self.tools = [
+            genai.protos.Tool(
+                function_declarations=[
+                    genai.protos.FunctionDeclaration(
+                        name="get_quote",
+                        description="Get the current live price quote for a stock symbol. Use this whenever the trader asks about a stock price, bid/ask, volume, or day range. Symbol format: RELIANCE.NS, INFY.NS, TCS.NS, NIFTY50, etc.",
+                        parameters=content_types.to_function_library({
+                            "type": "object",
+                            "properties": {
+                                "symbol": {"type": "string", "description": "NSE stock symbol e.g. RELIANCE.NS, INFY.NS, NIFTY50"}
+                            },
+                            "required": ["symbol"]
+                        })["properties"][0]
+                    ),
+                    genai.protos.FunctionDeclaration(
+                        name="get_portfolio",
+                        description="Get the trader's account summary: available funds, total portfolio value, funds used. Use when the trader asks about account balance, funds, or overall portfolio value.",
+                        parameters=content_types.to_function_library({
+                            "type": "object",
+                            "properties": {}
+                        })["properties"][0]
+                    ),
+                    genai.protos.FunctionDeclaration(
+                        name="get_positions",
+                        description="Get all current open positions with live P&L. Use when the trader asks about positions, holdings, unrealized P&L, or exposure.",
+                        parameters=content_types.to_function_library({
+                            "type": "object",
+                            "properties": {}
+                        })["properties"][0]
+                    ),
+                    genai.protos.FunctionDeclaration(
+                        name="get_order_history",
+                        description="Get recent order history. Use when the trader asks what orders have been placed, filled, cancelled, etc.",
+                        parameters=content_types.to_function_library({
+                            "type": "object",
+                            "properties": {
+                                "status": {"type": "string", "description": "Filter by order status. Options: ALL, FILLED, PARTIAL, REJECTED, CANCELLED"}
+                            }
+                        })["properties"][0]
+                    ),
+                    genai.protos.FunctionDeclaration(
+                        name="search_instrument",
+                        description="Search the instrument master to find valid symbols and their details. Use to verify a symbol before including it in an order draft.",
+                        parameters=content_types.to_function_library({
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Search term e.g. 'Reliance', 'INFY', 'HDFC Bank'"}
+                            },
+                            "required": ["query"]
+                        })["properties"][0]
+                    ),
+                    genai.protos.FunctionDeclaration(
+                        name="create_order_draft",
+                        description="Create a draft order for the trader to review and approve. NEVER use this without first calling get_quote to get the latest price. This does NOT place an order — it only creates a draft that the trader must approve. The system will validate symbol, check risk limits, and display a confirmation card.",
+                        parameters=content_types.to_function_library({
+                            "type": "object",
+                            "properties": {
+                                "symbol": {"type": "string", "description": "Valid NSE symbol"},
+                                "side": {"type": "string", "description": "BUY or SELL"},
+                                "order_type": {"type": "string", "description": "MARKET, LIMIT, SL, or SL-M"},
+                                "quantity": {"type": "integer", "description": "Number of shares"},
+                                "price": {"type": "number", "description": "Required for LIMIT/SL orders"},
+                                "trigger_price": {"type": "number", "description": "Required for SL/SL-M orders"},
+                                "rationale": {"type": "string", "description": "Brief explanation of this order"}
+                            },
+                            "required": ["symbol", "side", "order_type", "quantity"]
+                        })["properties"][0]
+                    ),
+                    genai.protos.FunctionDeclaration(
+                        name="create_standing_instruction",
+                        description="Create a standing instruction (rule) that will automatically trigger an order when a condition is met. Example: 'If INFY drops below 1750, sell 50 shares'. The rule is stored and checked against live prices. It fires exactly once. Always show the trader the exact condition and action before creating — they must approve it.",
+                        parameters=content_types.to_function_library({
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Short name for this rule"},
+                                "symbol": {"type": "string"},
+                                "condition_type": {"type": "string", "description": "PRICE_ABOVE, PRICE_BELOW, or PERCENT_CHANGE"},
+                                "condition_value": {"type": "number", "description": "Price level or percent threshold"},
+                                "action_side": {"type": "string", "description": "BUY or SELL"},
+                                "action_quantity": {"type": "integer", "description": "Number of shares"},
+                                "action_order_type": {"type": "string", "description": "MARKET or LIMIT"},
+                                "expires_in_hours": {"type": "number", "description": "Auto-expire after N hours"}
+                            },
+                            "required": ["name", "symbol", "condition_type", "condition_value", "action_side", "action_quantity"]
+                        })["properties"][0]
+                    )
+                ]
+            )
+        ]
+
         self.model = genai.GenerativeModel(
             model_name='gemini-1.5-pro',
-            tools=convert_tools_to_gemini_format(TOOLS),
+            tools=self.tools,
             system_instruction=SYSTEM_PROMPT
         )
         self.broker_url = settings.mock_api_url
@@ -231,10 +193,12 @@ class TradingAgent:
         chat_history = []
         for msg in messages[:-1]:  # All except the last one
             role = "user" if msg["role"] == "user" else "model"
-            chat_history.append({
-                "role": role,
-                "parts": [msg["content"]] if isinstance(msg["content"], str) else [str(msg["content"])]
-            })
+            content = msg["content"]
+            if isinstance(content, str):
+                chat_history.append({"role": role, "parts": [content]})
+            else:
+                # Handle complex content (tool results, etc.)
+                chat_history.append({"role": role, "parts": [str(content)]})
 
         # Start chat session
         chat = self.model.start_chat(history=chat_history)
@@ -250,74 +214,71 @@ class TradingAgent:
 
             try:
                 # Send message and get response
-                response = await chat.send_message_async(user_message)
+                response = chat.send_message(user_message)
 
-                # Check if we have function calls
-                if response.candidates[0].content.parts:
-                    for part in response.candidates[0].content.parts:
-                        # Handle text response
-                        if hasattr(part, 'text') and part.text:
-                            # Stream text token by token (simulate streaming)
-                            text = part.text
-                            # For simplicity, send the whole text at once
-                            # In production, you could split into smaller chunks
-                            yield f"data: {json.dumps({'type': 'text', 'content': text})}\n\n"
+                # Process response parts
+                has_function_calls = False
 
-                        # Handle function call
-                        elif hasattr(part, 'function_call') and part.function_call:
-                            func_call = part.function_call
-                            tool_name = func_call.name
-                            tool_args = dict(func_call.args)
+                for part in response.parts:
+                    # Handle text response
+                    if part.text:
+                        text = part.text
+                        # Stream text in chunks for better UX
+                        chunk_size = 50
+                        for i in range(0, len(text), chunk_size):
+                            chunk = text[i:i+chunk_size]
+                            yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
 
-                            yield f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'input': tool_args})}\n\n"
+                    # Handle function call
+                    elif part.function_call:
+                        has_function_calls = True
+                        func_call = part.function_call
+                        tool_name = func_call.name
+                        tool_args = dict(func_call.args)
 
-                            # Execute the tool
-                            result_str = await self._call_tool(tool_name, tool_args)
-                            result_data = json.loads(result_str)
+                        yield f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'input': tool_args})}\n\n"
 
-                            # If it's a draft tool, fire the callback
-                            if result_data.get("draft") and on_draft:
-                                await on_draft(tool_name, tool_args)
-                                yield f"data: {json.dumps({'type': 'draft', 'tool': tool_name, 'data': tool_args})}\n\n"
+                        # Execute the tool
+                        result_str = await self._call_tool(tool_name, tool_args)
+                        result_data = json.loads(result_str)
 
-                            # Send function response back to model
-                            function_response = {
-                                "function_call": func_call,
-                                "function_response": {
-                                    "name": tool_name,
-                                    "response": result_data
-                                }
-                            }
+                        # If it's a draft tool, fire the callback
+                        if result_data.get("draft") and on_draft:
+                            await on_draft(tool_name, tool_args)
+                            yield f"data: {json.dumps({'type': 'draft', 'tool': tool_name, 'data': tool_args})}\n\n"
 
-                            # Continue the conversation with function result
-                            user_message = ""  # Empty message to continue with function result
-                            response = await chat.send_message_async(
-                                genai.types.content_types.to_content({
-                                    "parts": [{
-                                        "function_response": {
-                                            "name": tool_name,
-                                            "response": result_data
-                                        }
-                                    }]
-                                })
+                        # Send function response back to model
+                        function_response = genai.protos.Part(
+                            function_response=genai.protos.FunctionResponse(
+                                name=tool_name,
+                                response={"result": result_data}
                             )
+                        )
 
-                            # Process the response after function call
-                            for part in response.candidates[0].content.parts:
-                                if hasattr(part, 'text') and part.text:
-                                    yield f"data: {json.dumps({'type': 'text', 'content': part.text})}\n\n"
+                        # Continue the conversation with function result
+                        user_message = None
+                        response = chat.send_message(function_response)
+
+                        # Process the response after function call
+                        for part in response.parts:
+                            if part.text:
+                                text = part.text
+                                chunk_size = 50
+                                for i in range(0, len(text), chunk_size):
+                                    chunk = text[i:i+chunk_size]
+                                    yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
 
                 # Check if conversation is complete (no more function calls)
-                has_function_calls = any(
-                    hasattr(part, 'function_call') and part.function_call
-                    for part in response.candidates[0].content.parts
-                )
-
                 if not has_function_calls:
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     break
 
             except Exception as e:
-                yield f"data: {json.dumps({'type': 'error', 'content': f'Error: {str(e)}'})}\n\n"
+                error_msg = f"Error: {str(e)}"
+                yield f"data: {json.dumps({'type': 'error', 'content': error_msg})}\n\n"
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 break
+
+        # If we hit max iterations, send done
+        if iteration >= max_iterations:
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"

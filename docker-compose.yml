@@ -58,6 +58,10 @@ services:
       - MOCK_API_URL=http://mock-api:8001
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - APPROVAL_TOKEN_SECRET=${APPROVAL_TOKEN_SECRET}
+      - TRADE021_USERNAME=${TRADE021_USERNAME}
+      - TRADE021_PASSWORD=${TRADE021_PASSWORD}
+      - TRADE021_BASE_URL=${TRADE021_BASE_URL}
+      - USE_REAL_API=${USE_REAL_API}
     depends_on:
       postgres:
         condition: service_healthy

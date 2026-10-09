@@ -9,6 +9,12 @@ class Settings(BaseSettings):
     # Google Gemini
     gemini_api_key: str
 
+    # 021 Trade API
+    trade021_username: str = ""  # Your UCC (e.g., HACK1234)
+    trade021_password: str = ""  # Your sign-up password
+    trade021_base_url: str = "https://devapi.021.trade/api/developer-api/v1"
+    use_real_api: bool = False  # Set to True to use real 021 API instead of mock
+
     # Security
     approval_token_secret: str
     approval_token_ttl_seconds: int = 60  # token expires in 60 seconds
